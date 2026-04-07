@@ -127,6 +127,110 @@ def find_violations(df, time_col, pax_cols, limites_dict):
     return violations
 
 # ─────────────────────────────────────────────────────────────────
+# ANÁLISE DE ASSENTOS
+# ─────────────────────────────────────────────────────────────────
+
+# Aeroportos que usam análise de assentos
+ICAOS_ASSENTOS = {'SBCJ', 'SBHT', 'SBUR', 'SBPP', 'SBCR'}
+
+# Service types válidos para análise de assentos
+SERVICE_TYPES_ASSENTOS = {'J', 'C', 'G'}
+
+# Mapa de equipamento -> assentos
+ASSENTOS_EQUIPAMENTO = {
+    '73H':   186,
+    '32N':   174,
+    'E195':  118,
+    'E295':  136,
+    'ATR72':  70,
+}
+
+def get_assentos(aeronave_tipo):
+    """Retorna o número de assentos do equipamento ou None se não mapeado."""
+    if pd.isna(aeronave_tipo):
+        return None
+    return ASSENTOS_EQUIPAMENTO.get(str(aeronave_tipo).strip().upper())
+
+def find_seat_violations(df, time_col, limites_dict):
+    """
+    Detecta janelas de 60 min onde a soma de assentos ultrapassa o limite
+    para os aeroportos que usam análise de assentos.
+    Considera apenas SERVICE_TYPE in {J, C, G} e equipamentos mapeados.
+    Agrupa por (ICAO, MOVIMENTO_TIPO, DATA) — mesmo limite de PAX reutilizado.
+    """
+    df = df.copy()
+
+    # Filtrar aeroportos relevantes
+    df = df[df['__icao__'].isin(ICAOS_ASSENTOS)].copy()
+    if df.empty:
+        return []
+
+    # Filtrar service type
+    if 'SERVICE_TYPE' in df.columns:
+        df = df[df['SERVICE_TYPE'].str.strip().str.upper().isin(SERVICE_TYPES_ASSENTOS)].copy()
+    if df.empty:
+        return []
+
+    # Mapear assentos
+    df['__assentos__'] = df['AERONAVE_TIPO'].apply(get_assentos)
+    df = df[df['__assentos__'].notna()].copy()   # ignorar equipamentos não mapeados
+    if df.empty:
+        return []
+
+    df['__min__'] = df[time_col].apply(parse_minutes)
+    if 'PREVISTO_DATA' in df.columns:
+        df['__data__'] = pd.to_datetime(df['PREVISTO_DATA'], errors='coerce').dt.date
+    else:
+        df['__data__'] = pd.Timestamp('today').date()
+
+    mov_col_presente = 'MOVIMENTO_TIPO' in df.columns
+    group_keys = ['__icao__', '__data__']
+    if mov_col_presente:
+        group_keys.insert(1, 'MOVIMENTO_TIPO')
+
+    violations = []
+    seen = set()
+
+    for keys, grupo in df.groupby(group_keys):
+        if mov_col_presente:
+            icao, movimento, data = keys
+        else:
+            icao, data = keys
+            movimento = '*'
+
+        limite = get_limite(limites_dict, icao, movimento)
+        grupo = grupo.dropna(subset=['__min__']).sort_values('__min__')
+        mov_label = movimento if mov_col_presente else '—'
+
+        for _, row in grupo.iterrows():
+            start = int(row['__min__'])
+            key = (icao, mov_label, str(data), start, 'seat')
+            if key in seen:
+                continue
+
+            ops_janela = grupo[
+                (grupo['__min__'] >= start) &
+                (grupo['__min__'] < start + 60)
+            ]
+            total_assentos = ops_janela['__assentos__'].sum()
+
+            if total_assentos > limite:
+                seen.add(key)
+                violations.append({
+                    'icao':          icao,
+                    'movimento':     mov_label,
+                    'data':          data,
+                    'inicio_min':    start,
+                    'janela_label':  f"{minutes_to_hhmm(start)}–{minutes_to_hhmm(start + 60)}",
+                    'total_assentos': int(total_assentos),
+                    'limite':        limite,
+                    'excesso':       int(total_assentos - limite),
+                    'indices_ops':   ops_janela.index.tolist(),
+                })
+
+    return violations
+
+# ─────────────────────────────────────────────────────────────────
 # CSS
 # ─────────────────────────────────────────────────────────────────
 
@@ -200,8 +304,26 @@ def main():
 
         if 'limites_df' not in st.session_state:
             st.session_state.limites_df = pd.DataFrame([
-                {'ICAO': 'SBRF', 'Movimento': 'P', 'Limite PAX/hora': 3000},
-                {'ICAO': 'SBRF', 'Movimento': 'D', 'Limite PAX/hora': 3000},
+                {'ICAO': 'SBUL', 'Movimento': 'P', 'Limite PAX/hora': 456},
+                {'ICAO': 'SBUL', 'Movimento': 'D', 'Limite PAX/hora': 456},
+                {'ICAO': 'SBUR', 'Movimento': 'P', 'Limite PAX/hora': 70},
+                {'ICAO': 'SBUR', 'Movimento': 'D', 'Limite PAX/hora': 71},
+                {'ICAO': 'SBMK', 'Movimento': 'P', 'Limite PAX/hora': 205},
+                {'ICAO': 'SBMK', 'Movimento': 'D', 'Limite PAX/hora': 205},
+                {'ICAO': 'SBCG', 'Movimento': 'P', 'Limite PAX/hora': 570},
+                {'ICAO': 'SBCG', 'Movimento': 'D', 'Limite PAX/hora': 570},
+                {'ICAO': 'SBPP', 'Movimento': 'P', 'Limite PAX/hora': 100},
+                {'ICAO': 'SBPP', 'Movimento': 'D', 'Limite PAX/hora': 100},
+                {'ICAO': 'SBCR', 'Movimento': 'P', 'Limite PAX/hora': 100},
+                {'ICAO': 'SBCR', 'Movimento': 'D', 'Limite PAX/hora': 100},
+                {'ICAO': 'SBHT', 'Movimento': 'P', 'Limite PAX/hora': 135},
+                {'ICAO': 'SBHT', 'Movimento': 'D', 'Limite PAX/hora': 135},
+                {'ICAO': 'SBCJ', 'Movimento': 'P', 'Limite PAX/hora': 170},
+                {'ICAO': 'SBCJ', 'Movimento': 'D', 'Limite PAX/hora': 170},
+                {'ICAO': 'SBSN', 'Movimento': 'P', 'Limite PAX/hora': 310},
+                {'ICAO': 'SBSN', 'Movimento': 'D', 'Limite PAX/hora': 310},
+                {'ICAO': 'SBMA', 'Movimento': 'P', 'Limite PAX/hora': 260},
+                {'ICAO': 'SBMA', 'Movimento': 'D', 'Limite PAX/hora': 300},
             ])
 
         limites_editado = st.data_editor(
@@ -357,23 +479,139 @@ def main():
         ]
         st.dataframe(pd.DataFrame(resumo_rows), use_container_width=True, hide_index=True)
 
+    # ── Diagnóstico de Assentos ──────────────────────────────────
+    seat_violations = find_seat_violations(df_raw, time_col, limites_dict)
+
+    icaos_assentos_presentes = sorted(df_raw['__icao__'].unique().tolist())
+    icaos_com_analise = [i for i in icaos_assentos_presentes if i in ICAOS_ASSENTOS]
+
+    if icaos_com_analise:
+        st.markdown("---")
+        st.subheader("🪑 Diagnóstico de Assentos")
+        st.caption(
+            f"Aeroportos com análise de assentos neste arquivo: **{', '.join(icaos_com_analise)}** · "
+            f"Equipamentos: {', '.join(f'{k}={v}' for k,v in ASSENTOS_EQUIPAMENTO.items())} · "
+            f"Service types: {', '.join(sorted(SERVICE_TYPES_ASSENTOS))}"
+        )
+
+        cs1, cs2, cs3 = st.columns(3)
+        with cs1:
+            ops_seat = df_raw[
+                df_raw['__icao__'].isin(ICAOS_ASSENTOS) &
+                (df_raw.get('SERVICE_TYPE', pd.Series(dtype=str))
+                    .str.strip().str.upper().isin(SERVICE_TYPES_ASSENTOS)
+                 if 'SERVICE_TYPE' in df_raw.columns else pd.Series([True]*len(df_raw)))
+            ]
+            st.markdown(f'<div class="kpi"><small>Operações analisadas (assentos)</small><b>{len(ops_seat):,}</b></div>', unsafe_allow_html=True)
+        with cs2:
+            cls = "kpi-warn" if seat_violations else "kpi-ok"
+            st.markdown(f'<div class="kpi {cls}"><small>Janelas violadas (assentos)</small><b>{len(seat_violations):,}</b></div>', unsafe_allow_html=True)
+        with cs3:
+            total_exc_seat = sum(v['excesso'] for v in seat_violations)
+            cls = "kpi-warn" if total_exc_seat > 0 else "kpi-ok"
+            st.markdown(f'<div class="kpi {cls}"><small>Assentos excedentes total</small><b>{total_exc_seat:,}</b></div>', unsafe_allow_html=True)
+
+        if seat_violations:
+            resumo_seat = {}
+            for v in seat_violations:
+                k = (v['icao'], v['movimento'])
+                resumo_seat.setdefault(k, {'janelas': 0, 'excesso': 0})
+                resumo_seat[k]['janelas'] += 1
+                resumo_seat[k]['excesso'] += v['excesso']
+            resumo_seat_rows = [
+                {
+                    'ICAO': k[0],
+                    'Movimento': MOV_LABELS.get(k[1], k[1]),
+                    'Janelas violadas': v['janelas'],
+                    'Assentos excedentes': v['excesso'],
+                    'Limite aplicado': get_limite(limites_dict, k[0], k[1]),
+                }
+                for k, v in sorted(resumo_seat.items())
+            ]
+            with st.expander("📋 Ver resumo de violações de assentos"):
+                st.dataframe(pd.DataFrame(resumo_seat_rows), use_container_width=True, hide_index=True)
+                st.markdown("**Detalhe por janela:**")
+                for sv in seat_violations:
+                    mov_lbl = MOV_LABELS.get(sv['movimento'], sv['movimento'])
+                    ops_sv = df_raw.loc[sv['indices_ops'],
+                        [time_col, 'AERONAVE_TIPO', 'COD_RIMA'] +
+                        (['SERVICE_TYPE'] if 'SERVICE_TYPE' in df_raw.columns else []) +
+                        (['MOVIMENTO_TIPO'] if 'MOVIMENTO_TIPO' in df_raw.columns else [])
+                    ].copy()
+                    ops_sv['Assentos'] = ops_sv['AERONAVE_TIPO'].apply(get_assentos)
+                    st.markdown(
+                        f"**[{sv['icao']}] {mov_lbl} · {sv['data']} · {sv['janela_label']}** — "
+                        f"{sv['total_assentos']:,} assentos (excesso: +{sv['excesso']:,} · limite: {sv['limite']:,})"
+                    )
+                    st.dataframe(ops_sv, use_container_width=True)
+        else:
+            st.markdown('<div style="background:#dcfce7;border-left:4px solid #22c55e;border-radius:6px;padding:.8rem 1rem">✅ Nenhuma violação de assentos detectada nos aeroportos analisados.</div>', unsafe_allow_html=True)
+
     if not violations:
-        st.markdown('<br><div style="background:#dcfce7;border-left:4px solid #22c55e;border-radius:6px;padding:.8rem 1rem">✅ Nenhuma violação detectada — arquivo dentro dos limites em todos os aeroportos e movimentos.</div>', unsafe_allow_html=True)
+        st.markdown('<br><div style="background:#dcfce7;border-left:4px solid #22c55e;border-radius:6px;padding:.8rem 1rem">✅ Nenhuma violação de PAX detectada — arquivo dentro dos limites em todos os aeroportos e movimentos.</div>', unsafe_allow_html=True)
+        if not seat_violations:
+            return
+
+    # ── Colunas de horário disponíveis ───────────────────────────
+    # Sempre trabalha com PREVISTO e CALCO se existirem; time_col é a de análise
+    hor_cols_disponiveis = [c for c in ['PREVISTO_HORARIO', 'CALCO_HORARIO'] if c in df_raw.columns]
+
+    if not violations:
+        st.info("Nenhuma violação de PAX para corrigir. Apenas violações de assentos foram detectadas (revisar manualmente acima).")
         return
 
     # ── Correção manual por operação ─────────────────────────────
     st.markdown("---")
-    st.subheader("🔧 Correção Manual por Operação")
+    st.subheader("🔧 Correção Manual por Operação — PAX")
     st.caption("Cada janela é analisada pelo seu próprio limite (ICAO + tipo de movimento). Escolha o que ajustar em cada operação.")
 
     if 'correcoes' not in st.session_state:
-        st.session_state.correcoes = {}
+        st.session_state.correcoes = {}   # row_idx -> lista de dicts {coluna, valor, tipo_label}
 
     if 'df_trabalho' not in st.session_state:
         st.session_state.df_trabalho = df_raw.copy()
 
     df_work = st.session_state.df_trabalho
 
+    # ── AÇÃO EM MASSA: ajustar PAX de todas as violações ─────────
+    st.markdown("#### ⚡ Ação em massa")
+    col_massa1, col_massa2 = st.columns([3, 1])
+    with col_massa1:
+        st.caption(
+            "Aplica a sugestão de PAX_LOCAL para **todas** as operações excedentes de todas as violações. "
+            "Cada operação recebe a redução mínima necessária para zerar o excesso da sua janela."
+        )
+    with col_massa2:
+        aplicar_massa = st.button("📉 Aplicar PAX a todas as violações", use_container_width=True)
+
+    if aplicar_massa:
+        for viol in violations:
+            excesso_v   = viol['excesso']
+            ops_idx     = viol['indices_ops']
+            ops_sub     = df_work.loc[ops_idx, pax_cols].copy()
+            ops_sub     = ops_sub.apply(pd.to_numeric, errors='coerce').fillna(0)
+            ops_sub['__total__'] = ops_sub.sum(axis=1)
+            ops_sub     = ops_sub.sort_values('__total__', ascending=True)
+
+            acum = 0
+            for ridx, rrow in ops_sub.iterrows():
+                if acum >= excesso_v:
+                    break
+                pax_local_atual = int(pd.to_numeric(df_work.at[ridx, 'PAX_LOCAL'], errors='coerce') or 0)
+                restante        = max(0, excesso_v - acum)
+                novo_pax        = max(0, pax_local_atual - restante)
+                acum           += (pax_local_atual - novo_pax)
+                corrs = st.session_state.correcoes.setdefault(ridx, [])
+                # Substitui correção PAX anterior se existir
+                corrs = [c for c in corrs if c['coluna'] != 'PAX_LOCAL']
+                corrs.append({'coluna': 'PAX_LOCAL', 'valor': novo_pax, 'tipo_label': 'PAX'})
+                st.session_state.correcoes[ridx] = corrs
+
+        st.success(f"PAX sugerido aplicado a {len(st.session_state.correcoes)} operação(ões). Revise abaixo se necessário.")
+
+    st.markdown("---")
+
+    # ── Expanders por violação ────────────────────────────────────
     for v_idx, viol in enumerate(violations):
         icao      = viol['icao']
         movimento = viol['movimento']
@@ -385,12 +623,19 @@ def main():
         ops_idx   = viol['indices_ops']
 
         mov_tag_html = f'<span class="tag-{movimento}">{MOV_LABELS.get(movimento, movimento)}</span>'
-        titulo = f"⚠️  [{icao}]  {mov_tag_html}  {data}  ·  {janela}  ·  {pax_v:,} PAX  ·  excesso: +{excesso_v:,}  (limite: {limite_v:,})"
+        titulo = (
+            f"⚠️  [{icao}]  {mov_tag_html}  {data}  ·  {janela}  ·  "
+            f"{pax_v:,} PAX  ·  excesso: +{excesso_v:,}  (limite: {limite_v:,})"
+        )
 
         with st.expander(titulo, expanded=(v_idx == 0)):
-            cols_exibir = [time_col] + pax_cols + (
-                ['MOVIMENTO_TIPO'] if 'MOVIMENTO_TIPO' in df_work.columns else []
-            ) + ['COD_RIMA']
+            # Preview com todas colunas relevantes
+            cols_exibir = (
+                hor_cols_disponiveis +
+                pax_cols +
+                (['MOVIMENTO_TIPO'] if 'MOVIMENTO_TIPO' in df_work.columns else []) +
+                ['COD_RIMA']
+            )
             ops_df = df_work.loc[ops_idx, cols_exibir].copy()
             ops_df[pax_cols] = ops_df[pax_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
             ops_df['Total PAX'] = ops_df[pax_cols].sum(axis=1)
@@ -402,58 +647,100 @@ def main():
             for row_idx in ops_df.index:
                 row    = df_work.loc[row_idx]
                 pax_op = int(ops_df.at[row_idx, 'Total PAX'])
-                hor_atual = str(row[time_col])
                 mov_op = str(row.get('MOVIMENTO_TIPO', '—'))
+
+                # Horários atuais de ambas as colunas
+                hor_previsto = str(row.get('PREVISTO_HORARIO', '—')) if 'PREVISTO_HORARIO' in df_work.columns else '—'
+                hor_calco    = str(row.get('CALCO_HORARIO',    '—')) if 'CALCO_HORARIO'    in df_work.columns else '—'
+                hor_display  = f"Prev: `{hor_previsto}`"
+                if 'CALCO_HORARIO' in df_work.columns:
+                    hor_display += f"  ·  Calço: `{hor_calco}`"
 
                 st.markdown(
                     f"---\n**Operação #{row_idx}** &nbsp;·&nbsp; `{row['COD_RIMA']}` &nbsp;·&nbsp; "
                     f"<span class='tag-{mov_op}'>{MOV_LABELS.get(mov_op, mov_op)}</span> &nbsp;·&nbsp; "
-                    f"Horário: `{hor_atual}` &nbsp;·&nbsp; PAX: `{pax_op:,}`",
+                    f"{hor_display} &nbsp;·&nbsp; PAX: `{pax_op:,}`",
                     unsafe_allow_html=True
                 )
 
+                # Opções dinâmicas de acordo com colunas presentes
+                opcoes = ["Não alterar"]
+                if 'PREVISTO_HORARIO' in df_work.columns:
+                    opcoes.append("Ajustar PREVISTO_HORARIO")
+                if 'CALCO_HORARIO' in df_work.columns:
+                    opcoes.append("Ajustar CALCO_HORARIO")
+                if 'PREVISTO_HORARIO' in df_work.columns and 'CALCO_HORARIO' in df_work.columns:
+                    opcoes.append("Ajustar ambos os horários")
+                opcoes.append("Ajustar PAX_LOCAL")
+
+                # Pré-selecionar se já existe correção em massa
+                corrs_atuais = st.session_state.correcoes.get(row_idx, [])
+                colunas_com_corr = [c['coluna'] for c in corrs_atuais]
+                if 'PAX_LOCAL' in colunas_com_corr:
+                    idx_default = opcoes.index("Ajustar PAX_LOCAL")
+                elif 'PREVISTO_HORARIO' in colunas_com_corr and 'CALCO_HORARIO' in colunas_com_corr:
+                    idx_default = opcoes.index("Ajustar ambos os horários") if "Ajustar ambos os horários" in opcoes else 0
+                elif 'PREVISTO_HORARIO' in colunas_com_corr:
+                    idx_default = opcoes.index("Ajustar PREVISTO_HORARIO") if "Ajustar PREVISTO_HORARIO" in opcoes else 0
+                elif 'CALCO_HORARIO' in colunas_com_corr:
+                    idx_default = opcoes.index("Ajustar CALCO_HORARIO") if "Ajustar CALCO_HORARIO" in opcoes else 0
+                else:
+                    idx_default = 0
+
                 tipo_corr = st.radio(
                     "O que ajustar?",
-                    ["Não alterar", "Ajustar horário", "Ajustar PAX_LOCAL"],
+                    opcoes,
+                    index=idx_default,
                     key=f"tipo_{v_idx}_{row_idx}",
                     horizontal=True
                 )
 
-                if tipo_corr == "Ajustar horário":
-                    min_atual = parse_minutes(hor_atual) or 0
+                def horario_input(col_name, hor_atual_val, key_suffix):
+                    """Renderiza input de horário com sugestão."""
+                    min_atual = parse_minutes(hor_atual_val) or 0
                     sugestao  = minutes_to_hhmm(min(1439, min_atual + 60))
-                    novo_hor  = st.text_input(
-                        f"Novo horário (HH:MM) — sugestão fora da janela: `{sugestao}`",
+                    return st.text_input(
+                        f"Novo {col_name} (HH:MM) — sugestão fora da janela: `{sugestao}`",
                         value=sugestao,
-                        key=f"hor_{v_idx}_{row_idx}",
+                        key=f"{key_suffix}_{v_idx}_{row_idx}",
                         placeholder="Ex: 15:30"
                     )
-                    st.session_state.correcoes[row_idx] = {
-                        'tipo': 'horario', 'coluna': time_col, 'valor': novo_hor
-                    }
 
-                elif tipo_corr == "Ajustar PAX_LOCAL":
+                novas_corrs = []
+
+                if "Ajustar PREVISTO_HORARIO" in tipo_corr:
+                    novo = horario_input('PREVISTO_HORARIO', hor_previsto, 'prev')
+                    novas_corrs.append({'coluna': 'PREVISTO_HORARIO', 'valor': novo, 'tipo_label': 'Horário'})
+
+                if "Ajustar CALCO_HORARIO" in tipo_corr:
+                    novo = horario_input('CALCO_HORARIO', hor_calco, 'calco')
+                    novas_corrs.append({'coluna': 'CALCO_HORARIO', 'valor': novo, 'tipo_label': 'Horário'})
+
+                if tipo_corr == "Ajustar PAX_LOCAL":
                     pax_local_atual = int(pd.to_numeric(row.get('PAX_LOCAL', 0), errors='coerce') or 0)
                     restante        = max(0, excesso_v - acumulado_corrigido)
                     sugestao_pax    = max(0, pax_local_atual - restante)
 
+                    # Pré-popular com valor da ação em massa se existir
+                    massa_val = next((c['valor'] for c in corrs_atuais if c['coluna'] == 'PAX_LOCAL'), sugestao_pax)
+
                     novo_pax = st.number_input(
                         f"Novo PAX_LOCAL  (atual: {pax_local_atual:,}  ·  sugestão: {sugestao_pax:,})",
-                        min_value=0, value=sugestao_pax, step=1,
+                        min_value=0, value=int(massa_val), step=1,
                         key=f"pax_{v_idx}_{row_idx}"
                     )
                     acumulado_corrigido += (pax_local_atual - novo_pax)
-                    st.session_state.correcoes[row_idx] = {
-                        'tipo': 'pax', 'coluna': 'PAX_LOCAL', 'valor': novo_pax
-                    }
+                    novas_corrs.append({'coluna': 'PAX_LOCAL', 'valor': novo_pax, 'tipo_label': 'PAX'})
 
-                else:
+                if novas_corrs:
+                    st.session_state.correcoes[row_idx] = novas_corrs
+                elif tipo_corr == "Não alterar":
                     st.session_state.correcoes.pop(row_idx, None)
 
     # ── Aplicar ──────────────────────────────────────────────────
     st.markdown("---")
-    n_pend = len(st.session_state.correcoes)
-    st.markdown(f"**{n_pend} alteração(ões) configurada(s) e prontas para aplicar.**")
+    n_pend = sum(len(v) for v in st.session_state.correcoes.values())
+    st.markdown(f"**{n_pend} alteração(ões) em {len(st.session_state.correcoes)} operação(ões) prontas para aplicar.**")
 
     if st.button("✅ Aplicar todas as correções e gerar arquivo", type="primary", use_container_width=True):
         if not st.session_state.correcoes:
@@ -463,22 +750,23 @@ def main():
         df_final = df_work.copy()
         log = []
 
-        for idx, corr in st.session_state.correcoes.items():
-            valor_ant = df_final.at[idx, corr['coluna']]
-            df_final.at[idx, corr['coluna']] = corr['valor']
-            log.append({
-                'Índice':         idx,
-                'COD_RIMA':       df_final.at[idx, 'COD_RIMA'],
-                'ICAO':           df_final.at[idx, '__icao__'],
-                'Movimento':      df_final.at[idx, 'MOVIMENTO_TIPO'] if 'MOVIMENTO_TIPO' in df_final.columns else '—',
-                'Coluna':         corr['coluna'],
-                'Valor Original': valor_ant,
-                'Valor Novo':     corr['valor'],
-                'Tipo':           'Horário' if corr['tipo'] == 'horario' else 'PAX',
-            })
+        for idx, corrs in st.session_state.correcoes.items():
+            for corr in corrs:
+                valor_ant = df_final.at[idx, corr['coluna']]
+                df_final.at[idx, corr['coluna']] = corr['valor']
+                log.append({
+                    'Índice':         idx,
+                    'COD_RIMA':       df_final.at[idx, 'COD_RIMA'],
+                    'ICAO':           df_final.at[idx, '__icao__'],
+                    'Movimento':      df_final.at[idx, 'MOVIMENTO_TIPO'] if 'MOVIMENTO_TIPO' in df_final.columns else '—',
+                    'Coluna':         corr['coluna'],
+                    'Valor Original': valor_ant,
+                    'Valor Novo':     corr['valor'],
+                    'Tipo':           corr['tipo_label'],
+                })
 
         df_export = df_final.drop(columns=['__icao__'], errors='ignore')
-        st.success(f"✅ {len(log)} alteração(ões) aplicada(s).")
+        st.success(f"✅ {len(log)} alteração(ões) aplicada(s) em {len(st.session_state.correcoes)} operação(ões).")
 
         log_df = pd.DataFrame(log)
         st.dataframe(log_df, use_container_width=True)
@@ -487,7 +775,7 @@ def main():
         with col_a:
             st.download_button(
                 "📥 Baixar RIMA Corrigido (.csv)",
-                data=df_export.to_csv(index=False).encode('utf-8-sig'),
+                data=df_export.to_csv(index=False, sep=';').encode('utf-8-sig'),
                 file_name="RIMA_corrigido.csv", mime="text/csv",
                 use_container_width=True
             )
@@ -508,7 +796,7 @@ def main():
         violations_pos = find_violations(df_pos, time_col, pax_cols, limites_dict)
 
         if violations_pos:
-            st.warning(f"⚠️ Ainda existem {len(violations_pos)} janela(s) violada(s) após as correções.")
+            st.warning(f"⚠️ Ainda existem {len(violations_pos)} janela(s) de PAX violada(s) após as correções.")
             for vp in violations_pos:
                 mov_label = MOV_LABELS.get(vp['movimento'], vp['movimento'])
                 st.markdown(
@@ -520,9 +808,30 @@ def main():
             st.markdown(
                 '<div style="background:#dcfce7;border-left:4px solid #22c55e;'
                 'border-radius:6px;padding:.8rem 1rem">'
-                '✅ Todas as janelas dentro do limite após as correções.</div>',
+                '✅ Todas as janelas de PAX dentro do limite após as correções.</div>',
                 unsafe_allow_html=True
             )
+
+        # Verificação pós-correção: assentos
+        seat_violations_pos = find_seat_violations(df_pos, time_col, limites_dict)
+        icaos_com_analise_pos = [i for i in df_pos['__icao__'].unique() if i in ICAOS_ASSENTOS]
+        if icaos_com_analise_pos:
+            if seat_violations_pos:
+                st.warning(f"⚠️ Ainda existem {len(seat_violations_pos)} janela(s) de **assentos** violada(s) após as correções.")
+                for sv in seat_violations_pos:
+                    mov_label = MOV_LABELS.get(sv['movimento'], sv['movimento'])
+                    st.markdown(
+                        f"- `[{sv['icao']}]` **{mov_label}** · {sv['data']} · "
+                        f"{sv['janela_label']} · {sv['total_assentos']:,} assentos "
+                        f"(excesso: +{sv['excesso']:,} · limite: {sv['limite']:,})"
+                    )
+            else:
+                st.markdown(
+                    '<div style="background:#dcfce7;border-left:4px solid #22c55e;'
+                    'border-radius:6px;padding:.8rem 1rem">'
+                    '✅ Todas as janelas de assentos dentro do limite após as correções.</div>',
+                    unsafe_allow_html=True
+                )
 
 
 if __name__ == "__main__":
